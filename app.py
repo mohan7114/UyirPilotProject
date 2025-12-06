@@ -1,421 +1,757 @@
-import cv2
-import pandas as pd
-import numpy as np
-import tkinter as tk
-from tkinter import messagebox
+import os
 import sys
-from ultralytics import YOLO
-import cvzone
 import time
+import threading
+import subprocess
+
+# --- 1. ENVIRONMENT SETUP (CRITICAL FOR IP CAMERA) ---
+
+# Forces OpenCV to use TCP. Crucial for stable RTSP streams on WiFi/Ethernet.
+
+os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
+
+
+
+import cv2
+
+import pandas as pd
+
+import numpy as np
+
+import tkinter as tk
+
+from tkinter import messagebox
+
+from ultralytics import YOLO
+
+import cvzone
+
 import requests
-from gpiozero import LED  # GPIO for Raspberry Pi 5
+
+from gpiozero import OutputDevice
+
+
+
+# --- CONFIGURATION ---
+
+VEHICLE_PIN = 22     # Physical Pin 15
+
+PEDESTRIAN_PIN = 23  # Physical Pin 16
+
+DETECTION_DURATION = 30 # Default 30 Seconds
+
+
+
+# Camera Settings
+
+CAMERA_IP = "192.168.29.24"
+
+# Using Subtype=1 (SubStream) to reduce Lag. Change to 0 for MainStream if needed.
+
+IP_CAMERA_URL = f"rtsp://admin:admin%40123@{CAMERA_IP}:554/cam/realmonitor?channel=1&subtype=1"
+
+
+
+# Server Settings
+
+SERVER_URL = "http://10.166.111.216:8080"
+
+
+
+# --- THREADED CAMERA CLASS (NO LAG) ---
+
+class ThreadedCamera:
+
+    def __init__(self, src):
+
+        self.src = src
+
+        self.capture = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
+
+        # Attempt to lower internal buffer size
+
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+
+        
+
+        self.thread = threading.Thread(target=self.update, args=())
+
+        self.thread.daemon = True
+
+        self.status = False
+
+        self.frame = None
+
+        self.stopped = False
+
+        
+
+        # Read one frame to verify connection
+
+        if self.capture.isOpened():
+
+            self.status, self.frame = self.capture.read()
+
+        
+
+        self.start()
+
+
+
+    def start(self):
+
+        self.stopped = False
+
+        self.thread.start()
+
+
+
+    def update(self):
+
+        while not self.stopped:
+
+            if self.capture.isOpened():
+
+                # Read frames as fast as possible (draining the buffer)
+
+                (status, frame) = self.capture.read()
+
+                if status:
+
+                    self.frame = frame
+
+                    self.status = status
+
+                else:
+
+                    self.status = False
+
+            time.sleep(0.005) # Tiny sleep to save CPU
+
+
+
+    def read(self):
+
+        # Return the latest frame immediately
+
+        return self.status, self.frame
+
+    
+
+    def isOpened(self):
+
+        return self.capture.isOpened()
+
+    
+
+    def release(self):
+
+        self.stopped = True
+
+        try:
+
+            self.thread.join(timeout=1)
+
+        except:
+
+            pass
+
+        self.capture.release()
+
+
+
+# --- HELPER FUNCTIONS ---
+
+def trigger_pulse(pin_number):
+
+    """
+
+    Relay-a 1 Second ON pannitu, udane OFF (Close) pannidum.
+
+    """
+
+    try:
+
+        print(f"--- PULSE TRIGGER: Pin {pin_number} (ON for 1 sec) ---")
+
+        relay = OutputDevice(pin_number, active_high=True, initial_value=False)
+
+        time.sleep(1) # 1 Second Hold
+
+        relay.close() # Release Pin
+
+        print(f"--- PULSE END: Pin {pin_number} (OFF) ---")
+
+    except Exception as e:
+
+        print(f"GPIO Error: {e}")
+
+
+
+def calculate_pedestrian_time(max_count):
+
+    if max_count <= 0: return 10
+
+    elif 1 <= max_count <= 3: return 15
+
+    elif 4 <= max_count <= 5: return 20
+
+    else: return 30
 
 
 
 def show_error_window(title, message):
 
-    """Display error message in a window"""
     try:
+
         root = tk.Tk()
-        root.withdraw()  # Hide the main window
+
+        root.withdraw()
+
         messagebox.showerror(title, message)
+
         root.destroy()
 
-    except Exception:
-        # Fallback: print if no display available
-        print(f"[{title}] {message}")
+    except:
+
+        print(f"{title}: {message}")
+
 
 
 class AreaConfig:
+
     def __init__(self):
+
         self.areas = {}
+
         self.current_area = []
+
         self.drawing = False
+
         self.selecting_mode = False
+
        
 
     def reset_counters(self):
+
         for area in self.areas.values():
+
             area['counter'] = 0
 
+
+
     def add_point(self, x, y):
+
         if self.selecting_mode:
+
             self.current_area.append((x, y))
 
+
+
     def complete_area(self):
+
         if self.selecting_mode and len(self.current_area) >= 3:
+
             area_name = f'Area {len(self.areas) + 1}'
+
             self.areas[area_name] = {
+
                 'coordinates': self.current_area.copy(),
+
                 'color': (0, 0, 255),
+
                 'counter': 0
+
             }
+
         self.current_area = []
 
+
+
 def mouse_callback(event, x, y, flags, param):
+
     config = param
+
     if event == cv2.EVENT_LBUTTONDOWN and config.selecting_mode:
+
         config.add_point(x, y)
+
     elif event == cv2.EVENT_RBUTTONDOWN and config.selecting_mode:
+
         config.complete_area()
 
+
+
 def is_inside_polygon(point, polygon):
+
     x, y = point
+
     n = len(polygon)
+
     inside = False
+
     j = n - 1
+
     for i in range(n):
-        if ((polygon[i][1] > y) != (polygon[j][1] > y) and
+
+        if ((polygon[i][1] > y) != (polygon[j][1] > y) and 
+
             (x < (polygon[j][0] - polygon[i][0]) * (y - polygon[i][1]) /
+
              (polygon[j][1] - polygon[i][1]) + polygon[i][0])):
+
             inside = not inside
+
         j = i
+
     return inside
 
 
-def calculate_pedestrian_time(max_count):
-    """
-    Map maximum pedestrian count in the last 120s to green time (seconds).
-    Adjust these rules as needed.
-    """
-    if max_count <= 0:
-        return 0          # minimum time
-    elif 1 <= max_count <= 3:
-        return 10
-    elif 4 <= max_count <= 5:
-        return 15
-    else:
-        return 25         # heavy crowd
-
 
 def main():
-    cap = None
-    vehicle_signal = None
-    ped_signal = None
 
     try:
-        # ---------------- GPIO SETUP ----------------
-        try:
-            # Vehicle trigger: GPIO17 (BCM) -> Physical pin 11
-            # Pedestrian trigger: GPIO27 (BCM) -> Physical pin 13
-            vehicle_signal = LED(17)
-            ped_signal = LED(27)
-            # Start with vehicle GREEN, pedestrian RED
-            vehicle_signal.on()
-            ped_signal.off()
-            print("GPIO initialized: VEHICLE=GPIO17, PEDESTRIAN=GPIO27")
-        except Exception as e:
-            show_error_window(
-                "GPIO Error",
-                "Failed to initialize GPIO pins.\n\n"
-                f"Details: {e}\n\n"
-                "Check that:\n"
-                "- gpiozero is installed\n"
-                "- You are running on Raspberry Pi OS\n"
-                "- You have permission to use /dev/gpiomem (or run with sudo)."
-            )
-            return
 
-        # ---------------- YOLO MODEL ----------------
+        # Check dependencies
+
+        required_modules = {'cv2': cv2, 'pandas': pd, 'numpy': np, 'ultralytics': YOLO, 'cvzone': cvzone}
+
+       
+
+        # Initialize YOLO
+
         try:
+
+            print("Loading YOLO Model...")
+
             model = YOLO('best.pt')
+
         except Exception as e:
-            show_error_window(
-                "Model Error",
-                f"Failed to load YOLO model: {str(e)}\n\n"
-                "Please ensure 'best.pt' exists in the current directory."
-            )
+
+            show_error_window("Model Error", f"Failed to load YOLO model: {str(e)}")
+
             return
 
-        # ---------------- CAMERA ----------------
+
+
+        # Initialize Camera (THREADED)
+
         try:
-            cap = cv2.VideoCapture(0)
-            if not cap.isOpened():
-                raise Exception("Could not access the camera")
-        except Exception:
-            show_error_window(
-                "Camera Error",
-                "Failed to access camera.\n\n"
-                "Please check if:\n"
-                "1. Camera is properly connected\n"
-                "2. Camera is not used by another application\n"
-                "3. Permissions are enabled"
-            )
+
+            print(f"Connecting to IP Camera: {IP_CAMERA_URL}")
+
+            # Replacing USB logic with Threaded IP Camera logic
+
+            cap = ThreadedCamera(IP_CAMERA_URL)
+
+            time.sleep(1.0) # Allow buffer to fill
+
+            
+
+            if not cap.isOpened(): 
+
+                raise Exception("Could not open RTSP stream. Check network/URL.")
+
+                
+
+        except Exception as e:
+
+            show_error_window("Camera Error", str(e))
+
             return
 
-        # ---------------- CONFIG / WINDOW ----------------
+
+
         config = AreaConfig()
+
         cv2.namedWindow('RGB')
+
         cv2.setMouseCallback('RGB', mouse_callback, config)
 
 
-        print("Instructions:")
-        print("- Press 's' to toggle area selection mode")
-        print("- When in selection mode:")
-        print("  * Left click to add points for an area")
-        print("  * Right click to complete the current area")
-        print("- Press 'c' to clear all custom areas")
-        print("- Press 'q' to quit")
+
+        print("System Ready.")
 
 
-        url = "http://192.168.177.20/update"
 
-        # ---------------- STATE MACHINE ----------------
-        MAIN_GREEN_DURATION = 120  # Vehicle green duration (seconds)
-        phase = "vehicle_green"    # "vehicle_green" or "ped_green"
+        # --- STATE MACHINE VARIABLES ---
+
+        phase = "DETECTING" 
+
         cycle_start_time = time.time()
-        ped_phase_start_time = None
-        ped_phase_duration = 0
 
-        max_ped_count_in_cycle = 0   # Maximum pedestrians seen during 120s
+        pedestrian_end_time = 0
 
-        print("Starting in VEHICLE GREEN phase for 120 seconds...")
+        final_ped_count = 0  # Renamed from max_ped_count_in_cycle
 
-        while True:
+        
+
+        current_detection_limit = DETECTION_DURATION 
+
+        
+
+        while True:    
+
             try:
+
+                # Read from Threaded Camera
+
                 ret, frame = cap.read()
-                if not ret:
-                    raise Exception("Failed to read frame from camera")
-                 
-                frame = cv2.resize(frame, (1020, 500))
-                frame_height, frame_width = frame.shape[:2]
-               
 
-                # Reset per-area counters for display
-                config.reset_counters()
+                
 
-          
-                # ---------------- YOLO INFERENCE ----------------
-                results = model.predict(frame)
-                a = results[0].boxes.data
-                px = pd.DataFrame(a).astype("float")
-                total_count = 0
-                area_total = 0
-                cx, cy = -1, -1
+                # Reconnection Logic
 
-                if not px.empty:
-                    for index, row in px.iterrows():
-                        x1, y1, x2, y2 = map(int, row[:4])
-                        cx = int((x1 + x2) / 2)
-                        cy = int((y1 + y2) / 2)
+                if not ret or frame is None:
 
-                        # Counting
+                    print(" ! Stream Lost. Reconnecting...")
 
-                        if not config.areas:
-                            total_count += 1
-                        else:
-                            for area_name, area_info in config.areas.items():
-                                if is_inside_polygon((cx, cy), area_info['coordinates']):
-                                    area_info['counter'] += 1
-                                    area_total += 1
+                    cap.release()
 
-                    log_message = f"Detection at ({cx}, {cy})"
-                else:
-                    log_message = "No detections in this frame."
+                    time.sleep(2)
 
-                print(log_message)
+                    cap = ThreadedCamera(IP_CAMERA_URL)
 
-                # ---------------- DRAW UI ----------------
-                mode_text = "Selection Mode: ON" if config.selecting_mode else "Selection Mode: OFF"
-                cv2.putText(
-                    frame, mode_text, (frame_width - 250, 30),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 0), 2
-                )
+                    time.sleep(1)
 
-              
-                # Completed areas
+                    continue
 
-                for area_name, area_info in config.areas.items():
-                    cv2.polylines(
-                        frame, [np.array(area_info['coordinates'], np.int32)],
-                        True, area_info['color'], 2
-                    )
-
-                    label_x, label_y = area_info['coordinates'][0]
-
-                    cv2.putText(
-                        frame, area_name, (label_x, label_y - 10),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, area_info['color'], 2
-                    )
-
-             
-                # Current area being created
-                if config.selecting_mode and len(config.current_area) > 0:
-                    points = np.array(config.current_area, np.int32)
-                    cv2.polylines(frame, [points], False, (255, 255, 0), 2)
-                    for point in config.current_area:
-                        cv2.circle(frame, point, 5, (0, 255, 0), -1)
-
-              
-                # Left side counter panel
-
-                overlay = frame.copy()
-                if config.areas:
-                    panel_height = 30 + (len(config.areas) * 40)
-                    cv2.rectangle(overlay, (10, 10), (200, panel_height), (0, 0, 0), -1)
-                    cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
                    
 
-                    y_position = 40
-                    for area_name, area_info in config.areas.items():
-                        cvzone.putTextRect(
-                            frame, f'{area_name}: {area_info["counter"]}',
-                            (20, y_position), scale=1.5, thickness=2,
-                            colorR=(255, 255, 0)
-                        )
-                        y_position += 40
+                frame = cv2.resize(frame, (1020, 500))
 
+                frame_height, frame_width = frame.shape[:2]
 
-                # Total count for this frame
-                display_count = area_total if config.areas else total_count
+                
 
+                # ====================================================
 
+                # PHASE 1: DETECTING (Vehicle Green)
 
-                # ---------------- UPDATE MAX COUNT IN CYCLE ----------------
+                # ====================================================
 
-                if phase == "vehicle_green":
-                    if display_count > max_ped_count_in_cycle:
-                        max_ped_count_in_cycle = display_count
+                if phase == "DETECTING":
 
+                    # Time Calculation
 
+                    elapsed = time.time() - cycle_start_time
 
-                # ---------------- STATE MACHINE LOGIC ----------------
-
-                now = time.time()
-                if phase == "vehicle_green":
-                    elapsed = now - cycle_start_time
-                    if elapsed >= MAIN_GREEN_DURATION:
-                        # 120 seconds over: compute pedestrian time
-                        ped_phase_duration = calculate_pedestrian_time(max_ped_count_in_cycle)
-                        print(f"Vehicle green phase over. Max pedestrians = {max_ped_count_in_cycle}")
-                        print(f"Pedestrian green time = {ped_phase_duration} seconds")
-                        if ped_phase_duration<=0:
-                            zero=1
-
-                        # Send OFF trigger to vehicle, ON to pedestrian
-                        vehicle_signal.off()
-                        ped_signal.on()
-                        print("TRIGGER: VEHICLE=0 (RED), PEDESTRIAN=1 (GREEN)")
+                    remaining = current_detection_limit - elapsed
 
 
 
-                        # Optional: send count to controller server once per cycle
+                    # Draw Phase UI
+
+                    cv2.putText(frame, f"Phase: DETECTING (Vehicle Green)", (20, 30), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+                    cv2.putText(frame, f"Switch in: {int(remaining)}s", (20, 60), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 0), 2)
+
+                    
+
+                    config.reset_counters()
+
+                    results = model.predict(frame, verbose=False)
+
+                    a = results[0].boxes.data
+
+                    px = pd.DataFrame(a).astype("float")
+
+                   
+
+                    total_count = 0 
+
+                    area_total = 0 
+
+                   
+
+                    if not px.empty:
+
+                        for index, row in px.iterrows():
+
+                            x1, y1, x2, y2 = map(int, row[:4])
+
+                            cx = int(x1 + x2) // 2
+
+                            cy = int(y1 + y2) // 2
+
+                           
+
+                            if not config.areas:
+
+                                total_count += 1
+
+                                w, h = x2-x1, y2-y1
+
+                                cvzone.cornerRect(frame,(x1,y1,w,h),3,2)
+
+                                cv2.circle(frame,(cx,cy),4,(255,0,0),-1)
+
+                                cvzone.putTextRect(frame,f'person',(x1,y1),1,1)
+
+                            else:
+
+                                for area_name, area_info in config.areas.items():
+
+                                    if is_inside_polygon((cx, cy), area_info['coordinates']):
+
+                                        area_info['counter'] += 1
+
+                                        area_total += 1
+
+                                        w, h = x2-x1, y2-y1
+
+                                        cvzone.cornerRect(frame,(x1,y1,w,h),3,2)
+
+                                        cv2.circle(frame,(cx,cy),4,(255,0,0),-1)
+
+                                        cvzone.putTextRect(frame,f'person',(x1,y1),1,1)
+
+                   
+
+                        # Logging logic (Optional)
+
+                        # log_message = f"Detection at ({cx}, {cy})"
+
+                        # print(log_message) 
+
+
+
+                    display_count = area_total if config.areas else total_count
+
+                    
+
+                    # --- CHANGE: Always take the CURRENT count (Last Updated) ---
+
+                    # Don't check for max, just update to current.
+
+                    final_ped_count = display_count 
+
+                    
+
+                    cv2.putText(frame, f"Current Count: {final_ped_count}", (20, 90), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+
+
+
+                    if elapsed >= current_detection_limit:
+
+                        print(f"Detection Done. Final Count: {final_ped_count}")
+
+                        
 
                         try:
-                            data = {"count": max_ped_count_in_cycle}
-                            response = requests.post(url, data=data)
-                            print("HTTP Response:", response.text)
-                        except requests.exceptions.RequestException as e:
-                            print(f"HTTP request failed: {e}")
 
-                        phase = "ped_green"
-                        ped_phase_start_time = now
+                            data = {"count": final_ped_count}
 
-                elif phase == "ped_green":
-                    elapsed_ped = now - ped_phase_start_time
-                    if elapsed_ped >= ped_phase_duration:
-                        # Pedestrian time finished Ã¢â€ â€™ back to vehicle green
-                        max_ped_count_in_cycle = 0
-                        cycle_start_time = now
-                        phase = "vehicle_green"
+                            requests.post(SERVER_URL, data=data, timeout=1) 
 
+                            print("Data Sent to Server.")
 
-                        # Trigger: vehicle green, pedestrian red
-                        vehicle_signal.on()
-                        ped_signal.off()
-                        print("TRIGGER: VEHICLE=1 (GREEN), PEDESTRIAN=0 (RED)")
-                        print("New vehicle phase started (120 seconds).")
+                        except:
+
+                            print("Server Error (Ignored)")
 
 
 
-                # ---------------- DISPLAY CURRENT PHASE ----------------
+                        # --- LOGIC: ZERO COUNT CHECK ---
 
-                phase_text = f"Phase: {phase}"
-                cv2.putText(
-                    frame, phase_text, (20, frame_height - 20),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
+                        if final_ped_count == 0:
 
-                )
+                            print("Zero Count: Skipping Pedestrian Phase.")
+
+                            
+
+                            trigger_pulse(VEHICLE_PIN)
+
+                            
+
+                            # Immediate Restart (No Delay)
+
+                            final_ped_count = 0
+
+                            cycle_start_time = time.time()
+
+                            
+
+                            # --- SPECIAL REQUIREMENT: 33 SECONDS ---
+
+                            current_detection_limit = 27 # Approx 33s total loop
+
+                            print("Vehicle Phase Restarted Immediately (Duration: 33s).")
+
+                            
+
+                        else:
+
+                            # --- NORMAL FLOW (Count > 0) ---
+
+                            trigger_pulse(PEDESTRIAN_PIN)
 
 
 
-                # Right side total count display
-                right_panel_x = frame_width - 250
-                overlay = frame.copy()
-                cv2.rectangle(overlay, (right_panel_x, 40), (frame_width - 20, 90), (0, 0, 0), -1)
-                cv2.addWeighted(overlay, 0.3, frame, 0.7, 0, frame)
-                cvzone.putTextRect(
-                    frame, f'Total Count: {display_count}',
-                    (right_panel_x + 10, 70), scale=1.5, thickness=2,
-                    colorR=(255, 255, 0)
-                )
+                            print(">>> Waiting 4 Seconds Delay... <<<")
+
+                            time.sleep(4)
+
+
+
+                            wait_time = calculate_pedestrian_time(final_ped_count)
+
+                            pedestrian_end_time = time.time() + wait_time
+
+                            phase = "ACTION"
+
+                            print(f"Pedestrian Phase Started for {wait_time}s")
+
+
+
+                # ====================================================
+
+                # PHASE 2: ACTION (Pedestrian Green - Variable Time)
+
+                # ====================================================
+
+                elif phase == "ACTION":
+
+                    remaining = pedestrian_end_time - time.time()
+
+                    
+
+                    cv2.putText(frame, "Phase: PEDESTRIAN CROSSING", (20, 30), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
+
+                    cv2.putText(frame, f"Wait Time: {int(remaining)}s", (20, 60), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
+
+                    cv2.putText(frame, "Detection Paused", (20, 90), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.6, (200, 200, 200), 1)
+
+
+
+                    if time.time() >= pedestrian_end_time:
+
+                        print("Pedestrian Time Over.")
+
+                        
+
+                        trigger_pulse(VEHICLE_PIN)
+
+
+
+                        print(">>> Waiting 9 Seconds Delay... <<<")
+
+                        time.sleep(9)
+
+
+
+                        final_ped_count = 0
+
+                        cycle_start_time = time.time()
+
+                        phase = "DETECTING"
+
+                        
+
+                        # --- RESET DURATION TO NORMAL (30s) ---
+
+                        current_detection_limit = DETECTION_DURATION
+
+                        print("Vehicle Detection Phase Started (Default Duration).")
+
+
+
+                # --- COMMON UI ELEMENTS ---
+
+                mode_text = "Selection: ON" if config.selecting_mode else "Selection: OFF"
+
+                cv2.putText(frame, mode_text, (frame_width - 250, 30), 
+
+                           cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+
+                
+
+                for area_name, area_info in config.areas.items():
+
+                    cv2.polylines(frame,[np.array(area_info['coordinates'],np.int32)],
+
+                                True, area_info['color'],2)
+
+                    lx, ly = area_info['coordinates'][0]
+
+                    cv2.putText(frame, area_name, (lx, ly-10), 
+
+                               cv2.FONT_HERSHEY_SIMPLEX, 0.5, area_info['color'], 2)
+
+                
+
+                if config.selecting_mode and len(config.current_area) > 0:
+
+                    pts = np.array(config.current_area, np.int32)
+
+                    cv2.polylines(frame, [pts], False, (255,255,0), 2)
+
+                    for pt in config.current_area:
+
+                        cv2.circle(frame, pt, 5, (0,255,0), -1)
+
 
 
                 cv2.imshow("RGB", frame)
+
+                
+
                 key = cv2.waitKey(1) & 0xFF
-               
 
-                if key == ord('q'):
+                if key == ord('q'): break
 
-                    break
-
-                elif key == ord('c'):
+                elif key == ord('c'): 
 
                     config.areas = {}
+
                     config.current_area = []
 
-                elif key == ord('s'):
+                elif key == ord('s'): 
 
                     config.selecting_mode = not config.selecting_mode
-                    if not config.selecting_mode:
-                        config.current_area = []
+
+                    if not config.selecting_mode: config.current_area = []
 
 
 
             except Exception as e:
-                show_error_window(
-                    "Runtime Error",
-                    f"An error occurred during execution:\n{str(e)}\n\n"
-                    "The application will now close."
-                )
 
-        MAIN_GREEN_DURATION=5
+                print(f"Runtime Error: {e}")
+
+                break
+
 
 
     except Exception as e:
 
-        show_error_window(
-            "Fatal Error",
-            f"A fatal error occurred:\n{str(e)}\n\n"
-            "Please check all dependencies are properly installed."
-        )
+        show_error_window("Fatal Error", str(e))
 
-   
+    
 
     finally:
+
         try:
-            if cap is not None:
-                cap.release()
+
+            cap.release()
+
             cv2.destroyAllWindows()
-        except Exception:
-            pass
 
-
-        try:
-            if vehicle_signal is not None:
-                vehicle_signal.off()
-
-            if ped_signal is not None:
-                ped_signal.off()
-
-        except Exception:
-
-            pass
+        except: pass
 
 
 
 if __name__ == "__main__":
 
     main()
-
-
