@@ -4,6 +4,8 @@ import time
 import threading
 import subprocess
 
+
+
 # --- 1. ENVIRONMENT SETUP (CRITICAL FOR IP CAMERA) ---
 
 # Forces OpenCV to use TCP. Crucial for stable RTSP streams on WiFi/Ethernet.
@@ -13,117 +15,60 @@ os.environ["OPENCV_FFMPEG_CAPTURE_OPTIONS"] = "rtsp_transport;tcp"
 
 
 import cv2
-
 import pandas as pd
-
 import numpy as np
-
 import tkinter as tk
-
 from tkinter import messagebox
-
 from ultralytics import YOLO
-
 import cvzone
-
 import requests
-
 from gpiozero import OutputDevice
-
-
-
 # --- CONFIGURATION ---
-
 VEHICLE_PIN = 22     # Physical Pin 15
-
 PEDESTRIAN_PIN = 23  # Physical Pin 16
-
 DETECTION_DURATION = 30 # Default 30 Seconds
 
-
-
 # Camera Settings
-
 CAMERA_IP = "192.168.29.24"
-
 # Using Subtype=1 (SubStream) to reduce Lag. Change to 0 for MainStream if needed.
-
 IP_CAMERA_URL = f"rtsp://admin:admin%40123@{CAMERA_IP}:554/cam/realmonitor?channel=1&subtype=1"
 
-
-
 # Server Settings
-
 SERVER_URL = "http://10.166.111.216:8080"
 
-
-
 # --- THREADED CAMERA CLASS (NO LAG) ---
-
 class ThreadedCamera:
-
     def __init__(self, src):
-
         self.src = src
-
         self.capture = cv2.VideoCapture(src, cv2.CAP_FFMPEG)
-
         # Attempt to lower internal buffer size
-
-        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-
-        
-
+        self.capture.set(cv2.CAP_PROP_BUFFERSIZE, 1)      
         self.thread = threading.Thread(target=self.update, args=())
-
         self.thread.daemon = True
-
         self.status = False
-
         self.frame = None
-
         self.stopped = False
 
         
-
         # Read one frame to verify connection
-
         if self.capture.isOpened():
-
-            self.status, self.frame = self.capture.read()
-
+            self.status, self.frame = self.capture.read()      
         
-
         self.start()
 
-
-
     def start(self):
-
         self.stopped = False
-
         self.thread.start()
 
-
-
     def update(self):
-
         while not self.stopped:
-
             if self.capture.isOpened():
-
                 # Read frames as fast as possible (draining the buffer)
-
                 (status, frame) = self.capture.read()
-
                 if status:
-
                     self.frame = frame
-
                     self.status = status
-
                 else:
-
                     self.status = False
 
             time.sleep(0.005) # Tiny sleep to save CPU
@@ -566,7 +511,7 @@ def main():
 
                             
 
-                            trigger_pulse(VEHICLE_PIN)
+                            #trigger_pulse(VEHICLE_PIN)
 
                             
 
@@ -580,7 +525,7 @@ def main():
 
                             # --- SPECIAL REQUIREMENT: 33 SECONDS ---
 
-                            current_detection_limit = 27 # Approx 33s total loop
+                            current_detection_limit = 30 # Approx 33s total loop
 
                             print("Vehicle Phase Restarted Immediately (Duration: 33s).")
 
@@ -755,3 +700,4 @@ def main():
 if __name__ == "__main__":
 
     main()
+
